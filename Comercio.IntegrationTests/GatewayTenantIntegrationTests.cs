@@ -11,7 +11,7 @@ namespace Comercio.IntegrationTests;
 /// </summary>
 public class GatewayTenantIntegrationTests (
     WebApplicationFactory<Program> factory
-)
+) : IClassFixture<WebApplicationFactory<Program>>
 {
     private readonly HttpClient _client = factory.CreateClient();
     [Fact]
