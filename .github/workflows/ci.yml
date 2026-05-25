@@ -23,7 +23,7 @@ jobs:
       run: dotnet restore Comercio.slnx
 
     - name: Compile the solution (Release mode)
-      run: dotnet build Comercio.sln --configuration Release --no-restore
+      run: dotnet build Comercio.slnx --configuration Release --no-restore
     
     - name: Run unit and integration tests
-      run: dotnet test Comercio.sln --configuration Release --no-build --verbosity normal
+      run: dotnet test Comercio.slnx --configuration Release --no-build --verbosity normal
