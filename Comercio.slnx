@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="Comercio.Gateway/Comercio.Gateway.csproj" />
+  <Project Path="Comercio.IntegrationTests/Comercio.IntegrationTests.csproj" />
+  <Project Path="Comercio.Shared/Comercio.Shared.csproj" />
+  <Project Path="Comercio.UnitTests/Comercio.UnitTests.csproj" />
+</Solution>
