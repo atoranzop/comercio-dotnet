@@ -1,4 +1,6 @@
 <Solution>
+  <Project Path="Catalog.Core/Catalog.Core.csproj" />
+  <Project Path="Catalog.Infrastructure/Catalog.Infrastructure.csproj" />
   <Project Path="Comercio.Gateway/Comercio.Gateway.csproj" />
   <Project Path="Comercio.IntegrationTests/Comercio.IntegrationTests.csproj" />
   <Project Path="Comercio.Shared/Comercio.Shared.csproj" />

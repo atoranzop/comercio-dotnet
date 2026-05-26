@@ -1,19 +1,43 @@
 ﻿using System.Net;
 using System.Net.Http.Json;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Catalog.Infrastructure.Persistence;
 using Xunit;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Comercio.IntegrationTests;
 
 /// <summary>
-/// Idustrial integration tests to check the perimetral behavior of 
+/// Industrial integration tests to check the perimetral behavior of 
 /// the API Gateway and its middlewares.
 /// </summary>
-public class GatewayTenantIntegrationTests (
-    WebApplicationFactory<Program> factory
-) : IClassFixture<WebApplicationFactory<Program>>
+public class GatewayTenantIntegrationTests : IClassFixture<WebApplicationFactory<Program>>
 {
-    private readonly HttpClient _client = factory.CreateClient();
+    private readonly HttpClient _client;
+
+    public GatewayTenantIntegrationTests(WebApplicationFactory<Program> factory)
+    {
+        // Configure custom services for testing
+        var customFactory = factory.WithWebHostBuilder(builder =>
+        {
+            builder.UseEnvironment("Test");
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<DbContextOptions<CatalogDbContext>>();
+                services.RemoveAll<CatalogDbContext>();
+
+                services.AddDbContext<CatalogDbContext>(options =>
+                options.UseInMemoryDatabase("GatewayTestDb"));
+            });
+        });
+
+        _client = customFactory.CreateClient();
+    }
+
     [Fact]
     public async Task DiagnosticEndpoint_MustReturnTenant_WhenValidHeader()
     {
@@ -73,7 +97,7 @@ public class GatewayTenantIntegrationTests (
     }
 
     /// <summary>
-    /// Auxilliary model to deserialization and analysis of the JSON Response 
+    /// Auxiliary model to deserialization and analysis of the JSON Response 
     /// of the Endpoint.
     /// </summary>
     private class TenantDiagnosticResponse
