@@ -1,7 +1,13 @@
 using System.Net;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.TestHost;
+using Catalog.Infrastructure.Persistence;
 using Xunit;
 using Comercio.Gateway;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Comercio.IntegrationTests;
 
@@ -11,7 +17,19 @@ public class GatewayRateLimitingTests: IClassFixture<WebApplicationFactory<Progr
 
     public GatewayRateLimitingTests(WebApplicationFactory<Program> factory)
     {
-        _factory = factory;
+        // Configure custom services for testing with isolated in-memory database
+        _factory = factory.WithWebHostBuilder(builder =>
+        {
+            builder.UseEnvironment("Test");
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll(typeof(DbContextOptions<CatalogDbContext>));
+                services.RemoveAll(typeof(CatalogDbContext));
+
+                services.AddDbContext<CatalogDbContext>(options =>
+                    options.UseInMemoryDatabase($"RateLimitingTestDb-{Guid.NewGuid()}"));
+            });
+        });
     }
 
     [Fact]
