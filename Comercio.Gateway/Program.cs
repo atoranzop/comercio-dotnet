@@ -84,9 +84,10 @@ builder.Services.AddReverseProxy()
                 // Inject internal header. Internal services will never validate 
                 // DNS or subdomains, they trust fully on this Gateway-provided
                 // header.
-                transformContext.ProxyRequest.Headers.Add(
+                transformContext.ProxyRequest.Headers.Remove("X-Internal-TenantId");
+                transformContext.ProxyRequest.Headers.TryAddWithoutValidation(
                     "X-Internal-TenantId",
-                    tenantContext.TenantId.ToString()
+                    tenantContext.TenantId.Value.ToString()
                 );
             }
 
