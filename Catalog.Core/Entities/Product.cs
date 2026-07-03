@@ -20,4 +20,10 @@ public class Product : IMultiTenant
     public decimal Price { get; set; }
     public int Stock { get; set; }
     public bool IsActive { get; set; } = true;
+
+    /// <summary>
+    /// Token used for  optimistic concurrency validation on inventory.
+    /// It prevents two concurrent to reduce the stock simultaneously witout controll.
+    /// </summary>
+    public Guid ConcurrencyToken { get; set; } = Guid.NewGuid();
 }

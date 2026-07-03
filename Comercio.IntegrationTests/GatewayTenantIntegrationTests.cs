@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Catalog.Infrastructure.Persistence;
+using Orders.Infrastructure.Persistence;
 using Xunit;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.AspNetCore.Hosting;
@@ -31,7 +32,15 @@ public class GatewayTenantIntegrationTests : IClassFixture<WebApplicationFactory
                 services.RemoveAll<CatalogDbContext>();
 
                 services.AddDbContext<CatalogDbContext>(options =>
-                options.UseInMemoryDatabase("GatewayTestDb"));
+                    options.UseInMemoryDatabase("GatewayTestDb")
+                    .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning)));
+
+                services.RemoveAll<DbContextOptions<OrdersDbContext>>();
+                services.RemoveAll<OrdersDbContext>();
+
+                services.AddDbContext<OrdersDbContext>(options =>
+                    options.UseInMemoryDatabase("GatewayTestOrdersDb")
+                    .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning)));
             });
         });
 

@@ -5,4 +5,6 @@
   <Project Path="Comercio.IntegrationTests/Comercio.IntegrationTests.csproj" />
   <Project Path="Comercio.Shared/Comercio.Shared.csproj" />
   <Project Path="Comercio.UnitTests/Comercio.UnitTests.csproj" />
+  <Project Path="Orders.Core/Orders.Core.csproj" />
+  <Project Path="Orders.Infrastructure/Orders.Infrastructure.csproj" />
 </Solution>

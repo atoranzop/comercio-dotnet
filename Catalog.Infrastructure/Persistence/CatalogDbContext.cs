@@ -40,6 +40,11 @@ public class CatalogDbContext : DbContext
             // a filter WHERE TenantId == _tenantContext.TenantId 
             entity.HasQueryFilter(p => p.TenantId == _tenantContext.TenantId);
 
+            // Optimistic concurrency control for inventory updates
+            entity.Property(p => p.ConcurrencyToken)
+                .IsRequired()
+                .IsConcurrencyToken();
+
             // Composed index
             // Optimizes the SQL queries that use the tenant filter
             entity.HasIndex(p => p.TenantId);
