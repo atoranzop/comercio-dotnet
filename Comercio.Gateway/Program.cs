@@ -6,6 +6,8 @@ using Catalog.Core.Entities;
 using Microsoft.EntityFrameworkCore;
 using Yarp.ReverseProxy.Transforms;
 using System.Threading.RateLimiting;
+using Orders.Infrastructure.Persistence;
+using Orders.Core.Entities;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -13,12 +15,16 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<InMemoryTenantStore>();
 builder.Services.AddScoped<ITenantContext, TenantContext>();
 
-// Inject DbContext configuring local SQLite (skip in Test environment - tests will configure it)
+// Inject DbContexts configuring local SQLite independent databases (modular monolite architecture)
+// This operation is skipped in Test environment - tests will configure it
 if (!builder.Environment.IsEnvironment("Test"))
 {
-    var dbPath = Path.Combine(AppContext.BaseDirectory, "comercio_catalog.db");
+    var catalogDbPath = Path.Combine(AppContext.BaseDirectory, "comercio_catalog.db");
+    var ordersDbPath = Path.Combine(AppContext.BaseDirectory, "comercio_orders.db");
     builder.Services.AddDbContext<CatalogDbContext>(options =>
-        options.UseSqlite($"Data Source={dbPath}"));
+        options.UseSqlite($"Data Source={catalogDbPath}"));
+    builder.Services.AddDbContext<OrdersDbContext>(options => 
+        options.UseSqlite($"Data Source={ordersDbPath}"));
 }
 
 builder.Services.AddControllers();
@@ -102,8 +108,11 @@ if (!app.Environment.IsEnvironment("Test"))
 {
     using (var scope = app.Services.CreateScope())
     {
-        var db = scope.ServiceProvider.GetRequiredService<CatalogDbContext>();
-        db.Database.EnsureCreated();
+        var catalogDb = scope.ServiceProvider.GetRequiredService<CatalogDbContext>();
+        catalogDb.Database.EnsureCreated();
+
+        var ordersDb = scope.ServiceProvider.GetRequiredService<OrdersDbContext>();
+        ordersDb.Database.EnsureCreated();
     }
 }
 
@@ -164,6 +173,123 @@ app.MapPost("/api/catalog/products", async (
         product
     );
 }).RequireRateLimiting("TenantRateLimiter");
+
+app.MapPost("/api/orders/checkout", async (
+    CheckoutRequest request, 
+    CatalogDbContext catalogDb, 
+    OrdersDbContext ordersDb
+) =>
+{
+    if (request.Items == null || !request.Items.Any())
+    {
+        return Results.BadRequest(new
+        {
+            Message = "No items provided for checkout."
+        });
+    }
+
+    // 1. Start explicit transaction over the Catalog database to
+    // freeze the stock atomically
+    using var catalogTransaction = await catalogDb.Database.BeginTransactionAsync();
+
+    try
+    {
+        var orderItems = new List<OrderItem>();
+        decimal totalPrice = 0;
+
+        foreach (var item in request.Items)
+        {
+            // Consult the product (with global TenantId filter applied automatically by EF Core)
+            var product = await catalogDb.Products.SingleOrDefaultAsync(p => p.ProductId == item.ProductId);
+
+            if (product == null)
+            {
+                await catalogTransaction.RollbackAsync();
+                return Results.NotFound(new
+                {
+                    Error = $"The product with ID {item.ProductId} does not exist on the database"
+                });
+            }
+
+            // Validate available stock strictly
+            if (product.Stock < item.Quantity)
+            {
+                await catalogTransaction.RollbackAsync();
+                return Results.BadRequest(new
+                {
+                    Error = $"Insufficient stock for product {product.Name}. " +
+                        "Available: {product.Stock}, Requested: {item.Quantity}"
+                });
+            }
+
+            // Discount available stock
+            product.Stock -= item.Quantity;
+
+            // Update concurrency token to break paralel concurrent transactions optimism 
+            product.ConcurrencyToken = Guid.NewGuid();
+
+            // Freeze the unit price at the moment of the purchase
+            var priceAtPurchase = product.Price;
+            totalPrice += priceAtPurchase * item.Quantity;
+
+            orderItems.Add(new OrderItem
+            {
+                OrderItemId = Guid.NewGuid(),
+                ProductId = product.ProductId,
+                Quantity = item.Quantity,
+                UnitPriceAtPurchase = priceAtPurchase
+            });
+        }
+
+        // Save changes on the catalog database (it will launch DbUpdateConcurrencyException if a concurrent 
+        // transaction has modified the same product on a way that restricts the stock to a negative value)
+        await catalogDb.SaveChangesAsync();
+        await catalogTransaction.CommitAsync();
+
+        // 2. Register the header and details of the order on the Orders database using logical isolation
+        var order = new Order
+        {
+            OrderId = Guid.NewGuid(),
+            CustomerId = request.CustomerId,
+            CreatedAt = DateTime.UtcNow,
+            Status = "Pending",
+            TotalPrice = totalPrice,
+            Items = orderItems
+        };
+
+        ordersDb.Orders.Add(order);
+        await ordersDb.SaveChangesAsync();
+
+        return Results.Created(
+            $"/api/orders/{order.OrderId}",
+            new
+            {
+                order.OrderId,
+                order.CreatedAt,
+                order.TotalPrice,
+                order.Status,
+                message = "Order registered successfully with logical isolation per tenant."
+            }
+        );
+    }
+    catch (DbUpdateConcurrencyException)
+    {
+        // Rollback the transaction if a concurrency conflict occurs
+        await catalogTransaction.RollbackAsync();
+        return Results.Conflict(new
+        {
+            Message = "Concurrency conflict detected. " +
+                "The stock of one or more products has changed. " + 
+                "Please try again."
+        });
+    }
+    catch (Exception ex)
+    {
+        await catalogTransaction.RollbackAsync();
+        return Results.Problem("An unexpected error occurred during the checkout process: " 
+            + ex.Message);
+    }
+});
 
 app.MapReverseProxy();
 

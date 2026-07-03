@@ -23,6 +23,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Comercio.Gateway\Comercio.Gateway.csproj" />
     <ProjectReference Include="..\Catalog.Infrastructure\Catalog.Infrastructure.csproj" />
+    <ProjectReference Include="..\Orders.Infrastructure\Orders.Infrastructure.csproj" />
   </ItemGroup>
 
 </Project>

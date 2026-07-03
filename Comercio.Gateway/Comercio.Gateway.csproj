@@ -18,6 +18,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Comercio.Shared\Comercio.Shared.csproj" />
     <ProjectReference Include="..\Catalog.Infrastructure\Catalog.Infrastructure.csproj" />
+    <ProjectReference Include="..\Orders.Infrastructure\Orders.Infrastructure.csproj" />
   </ItemGroup>
 
 </Project>

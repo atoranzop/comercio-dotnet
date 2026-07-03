@@ -5,6 +5,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Catalog.Infrastructure.Persistence;
+using Orders.Infrastructure.Persistence;
 using Xunit;
 using Comercio.Gateway;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -27,7 +28,16 @@ public class GatewayRateLimitingTests: IClassFixture<WebApplicationFactory<Progr
                 services.RemoveAll(typeof(CatalogDbContext));
 
                 services.AddDbContext<CatalogDbContext>(options =>
-                    options.UseInMemoryDatabase($"RateLimitingTestDb-{Guid.NewGuid()}"));
+                    options.UseInMemoryDatabase($"RateLimitingTestDb-{Guid.NewGuid()}")
+                    .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning)));
+
+                // Also register OrdersDbContext for the checkout endpoint
+                services.RemoveAll(typeof(DbContextOptions<Orders.Infrastructure.Persistence.OrdersDbContext>));
+                services.RemoveAll(typeof(Orders.Infrastructure.Persistence.OrdersDbContext));
+
+                services.AddDbContext<Orders.Infrastructure.Persistence.OrdersDbContext>(options =>
+                    options.UseInMemoryDatabase($"OrdersRateLimitingTestDb-{Guid.NewGuid()}")
+                    .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning)));
             });
         });
     }
