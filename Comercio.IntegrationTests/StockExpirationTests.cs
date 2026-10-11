@@ -24,6 +24,10 @@ public class StockExpirationTests : IClassFixture<WebApplicationFactory<Program>
     private readonly Guid _tenantAlfaId = Guid.Parse("a1111111-1111-1111-1111-111111111111");
     private readonly Guid _productId = Guid.NewGuid();
 
+    /// <summary>
+    /// Configures the test host with in-memory catalog and order databases and seeds the catalog.
+    /// </summary>
+    /// <param name="factory">The shared application factory used to create the test host.</param>
     public StockExpirationTests(WebApplicationFactory<Program> factory)
     {
         _factory = factory.WithWebHostBuilder(builder =>
@@ -48,6 +52,9 @@ public class StockExpirationTests : IClassFixture<WebApplicationFactory<Program>
         SeedDatabase();
     }
 
+    /// <summary>
+    /// Recreates the test catalog and inserts a product with five units of stock for Alpha Store.
+    /// </summary>
     private void SeedDatabase()
     {
         using var scope = _factory.Services.CreateScope();
@@ -73,6 +80,11 @@ public class StockExpirationTests : IClassFixture<WebApplicationFactory<Program>
         catalogDb.SaveChanges();
     }
 
+    /// <summary>
+    /// Verifies that the background service cancels an unpaid order older than fifteen minutes
+    /// and returns its two reserved units to the product's stock.
+    /// </summary>
+    /// <returns>A task representing the expiration and stock restoration test.</returns>
     [Fact]
     public async Task BackgroundService_DebeCancelarPedidoYDevolverStock_CuandoLaOrdenExcedeLos15MinutosUnpaid()
     {
@@ -125,6 +137,11 @@ public class StockExpirationTests : IClassFixture<WebApplicationFactory<Program>
         Assert.Equal("Cancelled", finalOrder.Status);
     }
 
+    /// <summary>
+    /// Removes a database context and its typed options so the test can register an in-memory context.
+    /// </summary>
+    /// <typeparam name="TContext">The database context whose registrations are removed.</typeparam>
+    /// <param name="services">The test host's service collection.</param>
     private static void RemoveDbContextRegistration<TContext>(IServiceCollection services)
         where TContext : DbContext
     {

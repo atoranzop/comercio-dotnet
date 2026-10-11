@@ -11,6 +11,12 @@ public class OrderCreatedEventHandler (
     ILogger<OrderCreatedEventHandler> logger
 ) : INotificationHandler<OrderCreatedEvent>
 {
+    /// <summary>
+    /// Logs an order audit entry and a simulated purchase confirmation email.
+    /// </summary>
+    /// <param name="notification">The created order's identifiers and total price.</param>
+    /// <param name="cancellationToken">The notification cancellation token; logging does not observe it.</param>
+    /// <returns>A completed task after both messages have been logged.</returns>
     public Task Handle(
         OrderCreatedEvent notification,
         CancellationToken cancellationToken
