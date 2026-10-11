@@ -48,30 +48,6 @@ public class GatewayTenantIntegrationTests : IClassFixture<WebApplicationFactory
     }
 
     [Fact]
-    public async Task DiagnosticEndpoint_MustReturnTenant_WhenValidHeader()
-    {
-        // Arrange
-        var request = new HttpRequestMessage(
-            HttpMethod.Get,
-            "/api/diagnostics/tenant"
-        );
-
-        request.Headers.Add("X-Tenant-Id", "alpha-store");
-
-        // Act
-        var response = await _client.SendAsync(request);
-
-        // Assert
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-
-        var body = await response.Content.ReadFromJsonAsync<TenantDiagnosticResponse>();
-        Assert.NotNull(body);
-        Assert.Equal("alpha-store", body.Subdomain);
-        Assert.Equal("Premium", body.Plan);
-        Assert.True(body.IsActive);
-    }
-
-    [Fact]
     public async Task DiagnosticEdnpoint_MustReturn403_WhenTenantIsSuspended()
     {
         // Arrange

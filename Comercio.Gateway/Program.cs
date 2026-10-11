@@ -1,60 +1,69 @@
 using Comercio.Shared;
 using Comercio.Gateway;
-using Comercio.Gateway.Dtos;
 using Catalog.Infrastructure.Persistence;
 using Catalog.Core.Entities;
-using Microsoft.EntityFrameworkCore;
-using Yarp.ReverseProxy.Transforms;
-using System.Threading.RateLimiting;
-using Orders.Infrastructure.Persistence;
 using Orders.Core.Entities;
+using Orders.Core.Events;
+using Orders.Infrastructure.Persistence;
+using Orders.Infrastructure.Clients;
+using Orders.Infrastructure.BackgroundServices;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.AspNetCore.RateLimiting;
+using System.Threading.RateLimiting;
+using Polly;
+using MediatR;
+using Comercio.Gateway.Dtos;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Dependency injections for common SaaS services
+// 1. Registrar servicios de plataforma
 builder.Services.AddSingleton<InMemoryTenantStore>();
 builder.Services.AddScoped<ITenantContext, TenantContext>();
 
-// Inject DbContexts configuring local SQLite independent databases (modular monolite architecture)
-// This operation is skipped in Test environment - tests will configure it
+// 2. Registrar DbContexts
 if (!builder.Environment.IsEnvironment("Test"))
 {
-    var catalogDbPath = Path.Combine(AppContext.BaseDirectory, "comercio_catalog.db");
-    var ordersDbPath = Path.Combine(AppContext.BaseDirectory, "comercio_orders.db");
     builder.Services.AddDbContext<CatalogDbContext>(options =>
-        options.UseSqlite($"Data Source={catalogDbPath}"));
-    builder.Services.AddDbContext<OrdersDbContext>(options => 
-        options.UseSqlite($"Data Source={ordersDbPath}"));
+        options.UseSqlite("Data Source=../comercio_catalog.db"));
+
+    builder.Services.AddDbContext<OrdersDbContext>(options =>
+        options.UseSqlite("Data Source=../comercio_orders.db"));
 }
+
+// 3. REGISTRAR CLIENTE HTTP DE PASARELA DE PAGOS CON RESILIENCIA DE POLLY (RNF-4)
+builder.Services.AddHttpClient<MockPaymentClient>(client =>
+{
+    // Simulamos que llama a un procesador externo (en este caso, apunta a nuestra propia API Gateway para las pruebas)
+    client.BaseAddress = new Uri("http://localhost:5000");
+})
+// Política 1: Reintentos asíncronos exponenciales ante fallas transitorias de red
+.AddTransientHttpErrorPolicy(policy => policy.WaitAndRetryAsync(
+    retryCount: 3,
+    sleepDurationProvider: attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)) // Reintentos en: 2s, 4s, 8s
+))
+// Política 2: Circuit Breaker para detener llamadas si el servicio se cae persistentemente
+.AddTransientHttpErrorPolicy(policy => policy.CircuitBreakerAsync(
+    handledEventsAllowedBeforeBreaking: 2, // Abre el circuito tras 2 fallos de red seguidos
+    durationOfBreak: TimeSpan.FromSeconds(15) // Lo mantiene abierto e impide llamadas por 15 segundos
+));
+
+// 4. Registrar MediatR para la orquestación de eventos
+builder.Services.AddMediatR(cfg => cfg.RegisterServicesFromAssembly(typeof(OrderCreatedEvent).Assembly));
+
+// 5. Registrar el procesador asíncrono en segundo plano (SaaS Background Stock Watcher)
+builder.Services.AddHostedService<StockReleaseBackgroundService>();
 
 builder.Services.AddControllers();
 
+// Configuración de Rate Limiting
 builder.Services.AddRateLimiter(options =>
 {
-    // Respond with HTTP 429 (Too many requests) when a client exceeds the
-    // limit
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
-
-    // Create a dynamic limiter partitionated by TenantId and Commertial Plan
     options.AddPolicy("TenantRateLimiter", context =>
     {
-        // Recover TenantContext injected in the pipeline by the Middleware
-        var tenantContext = context
-            .RequestServices
-            .GetRequiredService<ITenantContext>();
-
-        // If not tenant detected, apply restictive quota based on IP
-        var tenantKey = tenantContext.TenantId?.ToString() ?? 
-            context.Connection.RemoteIpAddress?.ToString() ??
-            "anonymous"; 
-        var isPremium = tenantContext.Plan?.Equals(
-            "Premium", 
-            StringComparison.OrdinalIgnoreCase
-        ) ?? false;
-
-        // Limit configuration
-        //  - Premium Plan: 100 requests in a 10 sec timeframe.
-        //  - Basic Plan: 5 requests in a 10 sec timeframe.
+        var tenantContext = context.RequestServices.GetRequiredService<ITenantContext>();
+        var tenantKey = tenantContext.TenantId?.ToString() ?? context.Connection.RemoteIpAddress?.ToString() ?? "anonimo";
+        var isPremium = tenantContext.Plan?.Equals("Premium", StringComparison.OrdinalIgnoreCase) ?? false;
         int permitLimit = isPremium ? 100 : 5;
 
         return RateLimitPartition.GetFixedWindowLimiter(
@@ -64,96 +73,31 @@ builder.Services.AddRateLimiter(options =>
                 AutoReplenishment = true,
                 PermitLimit = permitLimit,
                 Window = TimeSpan.FromSeconds(10),
-                QueueLimit = 0 // Reject incoming requests immediately if full quota
+                QueueLimit = 0
             });
     });
 });
 
-// CONFIGURE YARP WITH SECURE PROPAGATION
-// The API Gateway acts as the newtwork guardian. It reads the obtained TenantId
-// and injects it as an internal secure header so the micro-services/modules trust 
-// it blindly.
-builder.Services.AddReverseProxy()
-    .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"))
-    .AddTransforms(transformBuilder =>
-    {
-        transformBuilder.AddRequestTransform(async transformContext =>
-        {
-            // Get tenant context perimetrally validated
-            var tenantContext = transformContext
-                .HttpContext
-                .RequestServices
-                .GetRequiredService<ITenantContext>();
-            
-            if (tenantContext.TenantId.HasValue)
-            {
-                // Inject internal header. Internal services will never validate 
-                // DNS or subdomains, they trust fully on this Gateway-provided
-                // header.
-                transformContext.ProxyRequest.Headers.Remove("X-Internal-TenantId");
-                transformContext.ProxyRequest.Headers.TryAddWithoutValidation(
-                    "X-Internal-TenantId",
-                    tenantContext.TenantId.Value.ToString()
-                );
-            }
-
-            await Task.CompletedTask;
-        });
-    });
-
 var app = builder.Build();
 
-// Make sure than the DB is created at starting in development
-// Demo migration.
-if (!app.Environment.IsEnvironment("Test"))
+// Garantizar creación de base de datos relacionales locales
+using (var scope = app.Services.CreateScope())
 {
-    using (var scope = app.Services.CreateScope())
-    {
-        var catalogDb = scope.ServiceProvider.GetRequiredService<CatalogDbContext>();
-        catalogDb.Database.EnsureCreated();
-
-        var ordersDb = scope.ServiceProvider.GetRequiredService<OrdersDbContext>();
-        ordersDb.Database.EnsureCreated();
-    }
+    scope.ServiceProvider.GetRequiredService<CatalogDbContext>().Database.EnsureCreated();
+    scope.ServiceProvider.GetRequiredService<OrdersDbContext>().Database.EnsureCreated();
 }
 
-// Middleware pipelines register
 app.UseMiddleware<TenantMiddleware>();
 app.UseRateLimiter();
 
-// Endpoint Minimal API to perimeter isolation diagnostics
-app.MapGet("/api/diagnostics/tenant", (ITenantContext tenantContext) =>
-{
-    if (tenantContext.TenantId is null)
-    {
-        return Results.BadRequest(new
-        {
-            Message = "No tenant detected on HTTP request."
-        });
-    }
-
-    return Results.Ok(new
-    {
-        tenantContext.TenantId,
-        tenantContext.Subdomain,
-        tenantContext.Plan,
-        tenantContext.IsActive,
-        Message = "Tenant isolation verified successfully in .NET 10 pipeline"
-    });
-});
-
-// CATALOG ENDPOINTS (HU 2.1 / HU 3.1):
+// Endpoints Diagnóstico y Catálogo
 app.MapGet("/api/catalog/products", async (CatalogDbContext db) =>
 {
-    // EF Core will automatically apply the global filter based on scoped TenantContext
     var products = await db.Products.ToListAsync();
     return Results.Ok(products);
 }).RequireRateLimiting("TenantRateLimiter");
 
-app.MapPost("/api/catalog/products", async (
-    CreateProductRequest request,
-    CatalogDbContext db
-) =>
+app.MapPost("/api/catalog/products", async (CreateProductRequest request, CatalogDbContext db) =>
 {
     var product = new Product
     {
@@ -162,98 +106,67 @@ app.MapPost("/api/catalog/products", async (
         Name = request.Name,
         Price = request.Price,
         Stock = request.Stock,
-        IsActive = true
+        ConcurrencyToken = Guid.NewGuid()
     };
-
     db.Products.Add(product);
-
     await db.SaveChangesAsync();
-
-    return Results.Created(
-        $"/api/catalog/products/{product.ProductId}", 
-        product
-    );
+    return Results.Created($"/api/catalog/products/{product.ProductId}", product);
 }).RequireRateLimiting("TenantRateLimiter");
 
-app.MapPost("/api/orders/checkout", async (
-    CheckoutRequest request, 
-    CatalogDbContext catalogDb, 
-    OrdersDbContext ordersDb
-) =>
+// Endpoint de checkout que publica el evento OrderCreatedEvent usando MediatR
+app.MapPost("/api/orders/checkout", async (CheckoutRequest request, CatalogDbContext catalogDb, OrdersDbContext ordersDb, IMediator mediator) =>
 {
-    if (request.Items == null || !request.Items.Any())
+    if (request.Items == null || request.Items.Count == 0)
     {
-        return Results.BadRequest(new
-        {
-            Message = "No items provided for checkout."
-        });
+        return Results.BadRequest(new { Error = "El carrito no contiene productos." });
     }
 
-    // 1. Start explicit transaction over the Catalog database to
-    // freeze the stock atomically
     using var catalogTransaction = await catalogDb.Database.BeginTransactionAsync();
-
     try
     {
         var orderItems = new List<OrderItem>();
         decimal totalPrice = 0;
 
-        foreach (var item in request.Items)
+        foreach (var itemRequest in request.Items)
         {
-            // Consult the product (with global TenantId filter applied automatically by EF Core)
-            var product = await catalogDb.Products.SingleOrDefaultAsync(p => p.ProductId == item.ProductId);
+            var product = await catalogDb.Products.SingleOrDefaultAsync(p => p.ProductId == itemRequest.ProductId);
 
             if (product == null)
             {
                 await catalogTransaction.RollbackAsync();
-                return Results.NotFound(new
-                {
-                    Error = $"The product with ID {item.ProductId} does not exist on the database"
-                });
+                return Results.NotFound(new { Error = $"Producto '{itemRequest.ProductId}' no existe." });
             }
 
-            // Validate available stock strictly
-            if (product.Stock < item.Quantity)
+            if (product.Stock < itemRequest.Quantity)
             {
                 await catalogTransaction.RollbackAsync();
-                return Results.BadRequest(new
-                {
-                    Error = $"Insufficient stock for product {product.Name}. " +
-                        "Available: {product.Stock}, Requested: {item.Quantity}"
-                });
+                return Results.BadRequest(new { Error = $"Stock insuficiente para '{product.Name}'." });
             }
 
-            // Discount available stock
-            product.Stock -= item.Quantity;
-
-            // Update concurrency token to break paralel concurrent transactions optimism 
+            product.Stock -= itemRequest.Quantity;
             product.ConcurrencyToken = Guid.NewGuid();
 
-            // Freeze the unit price at the moment of the purchase
             var priceAtPurchase = product.Price;
-            totalPrice += priceAtPurchase * item.Quantity;
+            totalPrice += priceAtPurchase * itemRequest.Quantity;
 
             orderItems.Add(new OrderItem
             {
                 OrderItemId = Guid.NewGuid(),
                 ProductId = product.ProductId,
-                Quantity = item.Quantity,
+                Quantity = itemRequest.Quantity,
                 UnitPriceAtPurchase = priceAtPurchase
             });
         }
 
-        // Save changes on the catalog database (it will launch DbUpdateConcurrencyException if a concurrent 
-        // transaction has modified the same product on a way that restricts the stock to a negative value)
         await catalogDb.SaveChangesAsync();
         await catalogTransaction.CommitAsync();
 
-        // 2. Register the header and details of the order on the Orders database using logical isolation
         var order = new Order
         {
             OrderId = Guid.NewGuid(),
             CustomerId = request.CustomerId,
             CreatedAt = DateTime.UtcNow,
-            Status = "Pending",
+            Status = "Pendiente de Pago",
             TotalPrice = totalPrice,
             Items = orderItems
         };
@@ -261,39 +174,75 @@ app.MapPost("/api/orders/checkout", async (
         ordersDb.Orders.Add(order);
         await ordersDb.SaveChangesAsync();
 
-        return Results.Created(
-            $"/api/orders/{order.OrderId}",
-            new
-            {
-                order.OrderId,
-                order.CreatedAt,
-                order.TotalPrice,
-                order.Status,
-                message = "Order registered successfully with logical isolation per tenant."
-            }
-        );
+        // PUBLICACIÓN DEL EVENTO DE DOMINIO (RNF-6 / HU-3.3):
+        // Disparamos el evento asíncronamente en segundo plano
+        await mediator.Publish(new OrderCreatedEvent(order.OrderId, order.TenantId, order.TotalPrice, order.CustomerId));
+
+        return Results.Created($"/api/orders/{order.OrderId}", new 
+        {
+            order.OrderId,
+            order.TotalPrice,
+            order.Status,
+            Message = "Orden registrada y evento asíncrono publicado."
+        });
     }
     catch (DbUpdateConcurrencyException)
     {
-        // Rollback the transaction if a concurrency conflict occurs
         await catalogTransaction.RollbackAsync();
-        return Results.Conflict(new
-        {
-            Message = "Concurrency conflict detected. " +
-                "The stock of one or more products has changed. " + 
-                "Please try again."
-        });
+        return Results.StatusCode(StatusCodes.Status409Conflict);
     }
     catch (Exception ex)
     {
         await catalogTransaction.RollbackAsync();
-        return Results.Problem("An unexpected error occurred during the checkout process: " 
-            + ex.Message);
+        return Results.Problem($"Error en checkout: {ex.Message}");
     }
-});
+}).RequireRateLimiting("TenantRateLimiter");
 
-app.MapReverseProxy();
+// Endpoint que ejecuta la confirmación de pago llamando al cliente resiliente con Polly
+app.MapPost("/api/orders/{orderId:guid}/confirm-payment", async (Guid orderId, OrdersDbContext ordersDb, MockPaymentClient paymentClient) =>
+{
+    var order = await ordersDb.Orders.FindAsync(orderId);
+    if (order == null)
+    {
+        return Results.NotFound(new { Error = "La orden no existe." });
+    }
+
+    if (order.Status != "Pendiente de Pago")
+    {
+        return Results.BadRequest(new { Error = $"La orden no se puede pagar porque se encuentra en estado '{order.Status}'." });
+    }
+
+    // Llamamos a la pasarela de pagos simulada protegida por Polly (Reintentos + Disyuntor)
+    var success = await paymentClient.ProcessPaymentAsync(order.OrderId, order.TotalPrice);
+
+    if (success)
+    {
+        order.Status = "Pagada";
+        await ordersDb.SaveChangesAsync();
+        return Results.Ok(new { order.OrderId, order.Status, Message = "Pago confirmado mediante cliente resiliente." });
+    }
+
+    return Results.BadRequest(new { Error = "El cobro fue declinado por la pasarela externa de pagos." });
+}).RequireRateLimiting("TenantRateLimiter");
+
+// ENDPOINT SIMULADO DE LA PASARELA EXTERNA DE PAGOS (Para pruebas de fallas)
+// Permite probar que Polly reintente y abra el circuito si inyectamos errores.
+var paymentFailureCounter = 0;
+app.MapPost("/api/external/payments/process", (PaymentRequest request) =>
+{
+    paymentFailureCounter++;
+
+    // Inyectamos fallas transitorias de red para activar los reintentos de Polly:
+    // Fallará las primeras 2 llamadas con error de red (HTTP 503) y aprobará en la 3era.
+    if (paymentFailureCounter % 3 != 0)
+    {
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
+
+    return Results.Ok(new { Success = true, TransactionId = Guid.NewGuid() });
+});
 
 app.Run();
 
+public record PaymentRequest(Guid OrderId, decimal Amount);
 public partial class Program { }
