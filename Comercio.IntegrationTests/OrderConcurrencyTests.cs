@@ -17,33 +17,34 @@ namespace Comercio.IntegrationTests;
 public class OrderConcurrencyTests: IClassFixture<WebApplicationFactory<Program>>, IDisposable
 {
     private readonly WebApplicationFactory<Program> _factory;
-    private readonly SqliteConnection _catalogMasterConnection;
-    private readonly SqliteConnection _ordersMasterConnection;
+    private readonly SqliteConnection _masterConnection;
 
     public OrderConcurrencyTests(WebApplicationFactory<Program> factory)
     {
-        _catalogMasterConnection = new SqliteConnection("Data Source=file:concurrent_catalog?mode=memory&cache=shared");
-        _ordersMasterConnection = new SqliteConnection("Data Source=file:concurrent_orders?mode=memory&cache=shared");
-        _catalogMasterConnection.Open();
-        _ordersMasterConnection.Open();
+        _masterConnection = new SqliteConnection("Data Source=file:concurrent_checkout?mode=memory&cache=shared");
+        _masterConnection.Open();
 
-        // Configure custom services for testing with SQLite in-memory and shared cache
+        // Both contexts share one connection so the checkout transaction spans them.
         _factory = factory.WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Test");
             builder.ConfigureServices(services =>
             {
+                services.RemoveAll<SqliteConnection>();
+                services.AddScoped(_ => new SqliteConnection(
+                    "Data Source=file:concurrent_checkout?mode=memory&cache=shared"));
+
                 services.RemoveAll(typeof(DbContextOptions<CatalogDbContext>));
                 services.RemoveAll(typeof(CatalogDbContext));
 
-                services.AddDbContext<CatalogDbContext>(options =>
-                    options.UseSqlite("Data Source=file:concurrent_catalog?mode=memory&cache=shared"));
+                services.AddDbContext<CatalogDbContext>((provider, options) =>
+                    options.UseSqlite(provider.GetRequiredService<SqliteConnection>()));
 
                 services.RemoveAll(typeof(DbContextOptions<OrdersDbContext>));
                 services.RemoveAll(typeof(OrdersDbContext));
 
-                services.AddDbContext<OrdersDbContext>(options =>
-                    options.UseSqlite("Data Source=file:concurrent_orders?mode=memory&cache=shared"));
+                services.AddDbContext<OrdersDbContext>((provider, options) =>
+                    options.UseSqlite(provider.GetRequiredService<SqliteConnection>()));
             });
         });
 
@@ -52,13 +53,43 @@ public class OrderConcurrencyTests: IClassFixture<WebApplicationFactory<Program>
         var ordersDb = scope.ServiceProvider.GetRequiredService<OrdersDbContext>();
 
         catalogDb.Database.EnsureCreated();
-        ordersDb.Database.EnsureCreated();
+        ordersDb.Database.ExecuteSqlRaw(
+            """
+            CREATE TABLE IF NOT EXISTS "Orders" (
+                "OrderId" TEXT NOT NULL CONSTRAINT "PK_Orders" PRIMARY KEY,
+                "TenantId" TEXT NOT NULL,
+                "CustomerId" TEXT NOT NULL,
+                "CreatedAt" TEXT NOT NULL,
+                "Status" TEXT NOT NULL,
+                "TotalPrice" TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS "OrderItems" (
+                "OrderItemId" TEXT NOT NULL CONSTRAINT "PK_OrderItems" PRIMARY KEY,
+                "OrderId" TEXT NOT NULL,
+                "ProductId" TEXT NOT NULL,
+                "Quantity" INTEGER NOT NULL,
+                "UnitPriceAtPurchase" TEXT NOT NULL,
+                CONSTRAINT "FK_OrderItems_Orders_OrderId" FOREIGN KEY ("OrderId")
+                    REFERENCES "Orders" ("OrderId") ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS "OutboxMessages" (
+                "Id" TEXT NOT NULL CONSTRAINT "PK_OutboxMessages" PRIMARY KEY,
+                "EventType" TEXT NOT NULL,
+                "Payload" TEXT NOT NULL,
+                "OccurredAtUtc" TEXT NOT NULL,
+                "ProcessedAtUtc" TEXT NULL,
+                "Attempts" INTEGER NOT NULL,
+                "NextAttemptAtUtc" TEXT NOT NULL,
+                "LastError" TEXT NULL
+            );
+            CREATE INDEX IF NOT EXISTS "IX_OrderItems_OrderId" ON "OrderItems" ("OrderId");
+            CREATE INDEX IF NOT EXISTS "IX_Orders_TenantId" ON "Orders" ("TenantId");
+            """);
     }
 
     public void Dispose()
     {
-        _catalogMasterConnection.Dispose();
-        _ordersMasterConnection.Dispose();
+        _masterConnection.Dispose();
     }
 
     private Guid SeedProductWithLimitedStock()

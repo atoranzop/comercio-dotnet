@@ -9,6 +9,7 @@ using Xunit;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Comercio.Shared;
 
 namespace Comercio.IntegrationTests;
 
@@ -62,6 +63,10 @@ public class GatewayTenantIntegrationTests : IClassFixture<WebApplicationFactory
 
         // Assert
         Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<ApiResponse<object>>();
+        Assert.NotNull(body);
+        Assert.False(body.Success);
+        Assert.Equal("tenant_suspended", body.Error?.Code);
     }
 
     [Fact]
@@ -79,6 +84,32 @@ public class GatewayTenantIntegrationTests : IClassFixture<WebApplicationFactory
 
         // Assert
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<ApiResponse<object>>();
+        Assert.NotNull(body);
+        Assert.False(body.Success);
+        Assert.Equal("tenant_not_found", body.Error?.Code);
+    }
+
+    [Fact]
+    public async Task CheckoutValidation_ReturnsUnifiedErrorResponse()
+    {
+        var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            "/api/orders/checkout");
+        request.Headers.Add("X-Tenant-Id", "alpha-store");
+        request.Content = JsonContent.Create(new
+        {
+            CustomerId = Guid.NewGuid(),
+            Items = Array.Empty<object>()
+        });
+
+        var response = await _client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<ApiResponse<object>>();
+        Assert.NotNull(body);
+        Assert.False(body.Success);
+        Assert.Equal("validation_failed", body.Error?.Code);
     }
 
     /// <summary>

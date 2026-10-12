@@ -2,7 +2,7 @@ name: Continous Integration (CI) - Comercio
 
 on:
   push:
-    branches: [ master, feature/* ]
+    branches: [ master, feature/*, fix/* ]
   pull_request:
     branches: [ master ]
 
@@ -18,12 +18,34 @@ jobs:
       uses: actions/setup-dotnet@v4
       with:
         dotnet-version: 10.0.x
+
+    - name: Start PostgreSQL
+      run: |
+        sudo systemctl start postgresql
+        sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD 'postgres';"
+        sudo -u postgres createdb comercio
+
+    - name: Install Entity Framework CLI
+      run: |
+        dotnet tool install --global dotnet-ef --version 10.0.8
+        echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
     
     - name: Restore NuGet dependencies
       run: dotnet restore Comercio.slnx
 
     - name: Compile the solution (Release mode)
       run: dotnet build Comercio.slnx --configuration Release --no-restore
-    
+
+    - name: Apply PostgreSQL migrations
+      env:
+        ConnectionStrings__Postgres: "Host=localhost;Port=5432;Database=comercio;Username=postgres;Password=postgres"
+      run: |
+        dotnet ef database update --project Catalog.Infrastructure/Catalog.Infrastructure.csproj --startup-project Comercio.Gateway/Comercio.Gateway.csproj --context TenantDbContext
+        dotnet ef database update --project Catalog.Infrastructure/Catalog.Infrastructure.csproj --startup-project Comercio.Gateway/Comercio.Gateway.csproj --context CatalogDbContext
+        dotnet ef database update --project Orders.Infrastructure/Orders.Infrastructure.csproj --startup-project Comercio.Gateway/Comercio.Gateway.csproj --context OrdersDbContext
+
     - name: Run unit and integration tests
       run: dotnet test Comercio.slnx --configuration Release --no-build --verbosity normal
+      env:
+        ConnectionStrings__Postgres: "Host=localhost;Port=5432;Database=comercio;Username=postgres;Password=postgres"
+        COMERCIO_POSTGRES_TESTS: "1"

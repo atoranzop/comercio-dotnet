@@ -27,6 +27,8 @@ public class CatalogDbContext : DbContext
     {
         base.OnModelCreating(modelBuilder);
 
+        modelBuilder.HasDefaultSchema("catalog");
+
         // Mapping config for Product entity
         modelBuilder.Entity<Product>(entity =>
         {

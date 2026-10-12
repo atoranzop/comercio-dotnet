@@ -7,27 +7,49 @@ using Orders.Core.Events;
 using Orders.Infrastructure.Persistence;
 using Orders.Infrastructure.Clients;
 using Orders.Infrastructure.BackgroundServices;
+using Orders.Infrastructure.Outbox;
+using Comercio.Gateway.Middleware;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.RateLimiting;
 using System.Threading.RateLimiting;
 using Polly;
 using MediatR;
 using Comercio.Gateway.Dtos;
+using Microsoft.EntityFrameworkCore.Storage;
+using Npgsql;
+
+DotNetEnv.Env.NoClobber().TraversePath().Load();
 
 var builder = WebApplication.CreateBuilder(args);
 
 // 1. Registrar servicios de plataforma
-builder.Services.AddSingleton<InMemoryTenantStore>();
 builder.Services.AddScoped<ITenantContext, TenantContext>();
 
 // 2. Registrar DbContexts
-if (!builder.Environment.IsEnvironment("Test"))
+if (builder.Environment.IsEnvironment("Test"))
 {
-    builder.Services.AddDbContext<CatalogDbContext>(options =>
-        options.UseSqlite("Data Source=../comercio_catalog.db"));
+    builder.Services.AddSingleton<ITenantStore, InMemoryTenantStore>();
+}
+else
+{
+    var postgresConnection = builder.Configuration.GetConnectionString("Postgres")
+        ?? throw new InvalidOperationException(
+            "Missing connection string 'Postgres'. Configure ConnectionStrings__Postgres.");
 
-    builder.Services.AddDbContext<OrdersDbContext>(options =>
-        options.UseSqlite("Data Source=../comercio_orders.db"));
+    builder.Services.AddScoped(_ => new NpgsqlConnection(postgresConnection));
+
+    builder.Services.AddDbContext<TenantDbContext>((services, options) =>
+        options.UseNpgsql(services.GetRequiredService<NpgsqlConnection>(), npgsql =>
+            npgsql.MigrationsHistoryTable("__EFMigrationsHistory", "platform")));
+    builder.Services.AddScoped<ITenantStore, PostgresTenantStore>();
+
+    builder.Services.AddDbContext<CatalogDbContext>((services, options) =>
+        options.UseNpgsql(services.GetRequiredService<NpgsqlConnection>(), npgsql =>
+            npgsql.MigrationsHistoryTable("__EFMigrationsHistory", "catalog")));
+
+    builder.Services.AddDbContext<OrdersDbContext>((services, options) =>
+        options.UseNpgsql(services.GetRequiredService<NpgsqlConnection>(), npgsql =>
+            npgsql.MigrationsHistoryTable("__EFMigrationsHistory", "orders")));
 }
 
 // 3. REGISTRAR CLIENTE HTTP DE PASARELA DE PAGOS CON RESILIENCIA DE POLLY (RNF-4)
@@ -52,6 +74,11 @@ builder.Services.AddMediatR(cfg => cfg.RegisterServicesFromAssembly(typeof(Order
 
 // 5. Registrar el procesador asíncrono en segundo plano (SaaS Background Stock Watcher)
 builder.Services.AddHostedService<StockReleaseBackgroundService>();
+if (!builder.Environment.IsEnvironment("Test"))
+{
+    builder.Services.AddScoped<OutboxDispatcher>();
+    builder.Services.AddHostedService<OutboxDispatcherBackgroundService>();
+}
 
 builder.Services.AddControllers();
 
@@ -59,6 +86,15 @@ builder.Services.AddControllers();
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.OnRejected = async (rejectionContext, cancellationToken) =>
+    {
+        rejectionContext.HttpContext.Response.ContentType = "application/json";
+        await rejectionContext.HttpContext.Response.WriteAsJsonAsync(
+            ApiResponse<object>.Failed(
+                "rate_limit_exceeded",
+                "The request rate limit has been exceeded."),
+            cancellationToken);
+    };
     options.AddPolicy("TenantRateLimiter", context =>
     {
         var tenantContext = context.RequestServices.GetRequiredService<ITenantContext>();
@@ -80,13 +116,21 @@ builder.Services.AddRateLimiter(options =>
 
 var app = builder.Build();
 
-// Garantizar creación de base de datos relacionales locales
-using (var scope = app.Services.CreateScope())
+if (app.Environment.IsDevelopment())
 {
-    scope.ServiceProvider.GetRequiredService<CatalogDbContext>().Database.EnsureCreated();
-    scope.ServiceProvider.GetRequiredService<OrdersDbContext>().Database.EnsureCreated();
+    await TenantDevelopmentSeeder.SeedAsync(app.Services, app.Lifetime.ApplicationStopping);
 }
 
+app.UseMiddleware<GlobalExceptionMiddleware>();
+app.UseStatusCodePages(async statusContext =>
+{
+    var response = statusContext.HttpContext.Response;
+    await response.WriteAsJsonAsync(
+        ApiResponse<object>.Failed(
+            "http_error",
+            "The request could not be completed."),
+        statusContext.HttpContext.RequestAborted);
+});
 app.UseMiddleware<TenantMiddleware>();
 app.UseRateLimiter();
 
@@ -94,7 +138,7 @@ app.UseRateLimiter();
 app.MapGet("/api/catalog/products", async (CatalogDbContext db) =>
 {
     var products = await db.Products.ToListAsync();
-    return Results.Ok(products);
+    return Results.Ok(ApiResponse<IReadOnlyList<Product>>.Succeeded(products));
 }).RequireRateLimiting("TenantRateLimiter");
 
 app.MapPost("/api/catalog/products", async (CreateProductRequest request, CatalogDbContext db) =>
@@ -110,20 +154,28 @@ app.MapPost("/api/catalog/products", async (CreateProductRequest request, Catalo
     };
     db.Products.Add(product);
     await db.SaveChangesAsync();
-    return Results.Created($"/api/catalog/products/{product.ProductId}", product);
+    return Results.Created(
+        $"/api/catalog/products/{product.ProductId}",
+        ApiResponse<Product>.Succeeded(product));
 }).RequireRateLimiting("TenantRateLimiter");
 
 // Endpoint de checkout que publica el evento OrderCreatedEvent usando MediatR
-app.MapPost("/api/orders/checkout", async (CheckoutRequest request, CatalogDbContext catalogDb, OrdersDbContext ordersDb, IMediator mediator) =>
+app.MapPost("/api/orders/checkout", async (CheckoutRequest request, CatalogDbContext catalogDb, OrdersDbContext ordersDb) =>
 {
     if (request.Items == null || request.Items.Count == 0)
     {
-        return Results.BadRequest(new { Error = "El carrito no contiene productos." });
+        return Results.BadRequest(ApiResponse<object>.Failed(
+            "validation_failed",
+            "El carrito no contiene productos."));
     }
 
-    using var catalogTransaction = await catalogDb.Database.BeginTransactionAsync();
+    await using var catalogTransaction = await catalogDb.Database.BeginTransactionAsync();
+    Order order;
     try
     {
+        await ordersDb.Database.UseTransactionAsync(
+            catalogTransaction.GetDbTransaction());
+
         var orderItems = new List<OrderItem>();
         decimal totalPrice = 0;
 
@@ -134,13 +186,17 @@ app.MapPost("/api/orders/checkout", async (CheckoutRequest request, CatalogDbCon
             if (product == null)
             {
                 await catalogTransaction.RollbackAsync();
-                return Results.NotFound(new { Error = $"Producto '{itemRequest.ProductId}' no existe." });
+                return Results.NotFound(ApiResponse<object>.Failed(
+                    "product_not_found",
+                    "Uno de los productos solicitados no existe."));
             }
 
             if (product.Stock < itemRequest.Quantity)
             {
                 await catalogTransaction.RollbackAsync();
-                return Results.BadRequest(new { Error = $"Stock insuficiente para '{product.Name}'." });
+                return Results.BadRequest(ApiResponse<object>.Failed(
+                    "insufficient_stock",
+                    "No hay stock suficiente para uno de los productos solicitados."));
             }
 
             product.Stock -= itemRequest.Quantity;
@@ -157,11 +213,9 @@ app.MapPost("/api/orders/checkout", async (CheckoutRequest request, CatalogDbCon
                 UnitPriceAtPurchase = priceAtPurchase
             });
         }
-
         await catalogDb.SaveChangesAsync();
-        await catalogTransaction.CommitAsync();
 
-        var order = new Order
+        order = new Order
         {
             OrderId = Guid.NewGuid(),
             CustomerId = request.CustomerId,
@@ -173,29 +227,35 @@ app.MapPost("/api/orders/checkout", async (CheckoutRequest request, CatalogDbCon
 
         ordersDb.Orders.Add(order);
         await ordersDb.SaveChangesAsync();
+        ordersDb.OutboxMessages.Add(OutboxMessage.Create(
+            new OrderCreatedEvent(
+                order.OrderId,
+                order.TenantId,
+                order.TotalPrice,
+                order.CustomerId)));
+        await ordersDb.SaveChangesAsync();
 
-        // PUBLICACIÓN DEL EVENTO DE DOMINIO (RNF-6 / HU-3.3):
-        // Disparamos el evento asíncronamente en segundo plano
-        await mediator.Publish(new OrderCreatedEvent(order.OrderId, order.TenantId, order.TotalPrice, order.CustomerId));
-
-        return Results.Created($"/api/orders/{order.OrderId}", new 
-        {
-            order.OrderId,
-            order.TotalPrice,
-            order.Status,
-            Message = "Orden registrada y evento asíncrono publicado."
-        });
+        await catalogTransaction.CommitAsync();
     }
     catch (DbUpdateConcurrencyException)
     {
         await catalogTransaction.RollbackAsync();
-        return Results.StatusCode(StatusCodes.Status409Conflict);
+        return Results.Json(
+            ApiResponse<object>.Failed(
+                "concurrency_conflict",
+                "The requested changes conflict with a concurrent update."),
+            statusCode: StatusCodes.Status409Conflict);
     }
-    catch (Exception ex)
-    {
-        await catalogTransaction.RollbackAsync();
-        return Results.Problem($"Error en checkout: {ex.Message}");
-    }
+
+    return Results.Created(
+        $"/api/orders/{order.OrderId}",
+        ApiResponse<object>.Succeeded(new
+        {
+            order.OrderId,
+            order.TotalPrice,
+            order.Status,
+            Message = "Orden registrada; su evento quedó en cola para procesamiento."
+        }));
 }).RequireRateLimiting("TenantRateLimiter");
 
 // Endpoint que ejecuta la confirmación de pago llamando al cliente resiliente con Polly
@@ -204,12 +264,16 @@ app.MapPost("/api/orders/{orderId:guid}/confirm-payment", async (Guid orderId, O
     var order = await ordersDb.Orders.FindAsync(orderId);
     if (order == null)
     {
-        return Results.NotFound(new { Error = "La orden no existe." });
+        return Results.NotFound(ApiResponse<object>.Failed(
+            "order_not_found",
+            "La orden solicitada no existe."));
     }
 
     if (order.Status != "Pendiente de Pago")
     {
-        return Results.BadRequest(new { Error = $"La orden no se puede pagar porque se encuentra en estado '{order.Status}'." });
+        return Results.BadRequest(ApiResponse<object>.Failed(
+            "invalid_order_state",
+            "La orden no se puede pagar en su estado actual."));
     }
 
     // Llamamos a la pasarela de pagos simulada protegida por Polly (Reintentos + Disyuntor)
@@ -219,10 +283,17 @@ app.MapPost("/api/orders/{orderId:guid}/confirm-payment", async (Guid orderId, O
     {
         order.Status = "Pagada";
         await ordersDb.SaveChangesAsync();
-        return Results.Ok(new { order.OrderId, order.Status, Message = "Pago confirmado mediante cliente resiliente." });
+        return Results.Ok(ApiResponse<object>.Succeeded(new
+        {
+            order.OrderId,
+            order.Status,
+            Message = "Pago confirmado mediante cliente resiliente."
+        }));
     }
 
-    return Results.BadRequest(new { Error = "El cobro fue declinado por la pasarela externa de pagos." });
+    return Results.BadRequest(ApiResponse<object>.Failed(
+        "payment_declined",
+        "El cobro fue declinado por la pasarela externa de pagos."));
 }).RequireRateLimiting("TenantRateLimiter");
 
 // ENDPOINT SIMULADO DE LA PASARELA EXTERNA DE PAGOS (Para pruebas de fallas)
@@ -236,10 +307,18 @@ app.MapPost("/api/external/payments/process", (PaymentRequest request) =>
     // Fallará las primeras 2 llamadas con error de red (HTTP 503) y aprobará en la 3era.
     if (paymentFailureCounter % 3 != 0)
     {
-        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        return Results.Json(
+            ApiResponse<object>.Failed(
+                "payment_service_unavailable",
+                "El servicio de pagos no está disponible temporalmente."),
+            statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 
-    return Results.Ok(new { Success = true, TransactionId = Guid.NewGuid() });
+    return Results.Ok(ApiResponse<object>.Succeeded(new
+    {
+        Success = true,
+        TransactionId = Guid.NewGuid()
+    }));
 });
 
 app.Run();

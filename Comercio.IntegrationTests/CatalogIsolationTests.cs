@@ -7,7 +7,9 @@ using Xunit;
 
 using Catalog.Infrastructure.Persistence;
 using Catalog.Core.Entities;
+using Orders.Infrastructure.Persistence;
 using Comercio.Gateway;
+using Comercio.Shared;
 using Xunit.Sdk;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.AspNetCore.Hosting;
@@ -24,17 +26,18 @@ public class CatalogIsolationTests :
     {
         _factory = factory.WithWebHostBuilder(builder =>
         {
-            var customFactory = factory.WithWebHostBuilder(builder =>
+            builder.UseEnvironment("Test");
+            builder.ConfigureTestServices(services =>
             {
-                builder.UseEnvironment("Test");
-                builder.ConfigureTestServices(services =>
-                {
-                    services.RemoveAll<DbContextOptions<CatalogDbContext>>();
-                    services.RemoveAll<CatalogDbContext>();
+                services.RemoveAll<DbContextOptions<CatalogDbContext>>();
+                services.RemoveAll<CatalogDbContext>();
+                services.AddDbContext<CatalogDbContext>(options =>
+                    options.UseInMemoryDatabase("CatalogIsolationTestDb"));
 
-                    services.AddDbContext<CatalogDbContext>(options =>
-                    options.UseInMemoryDatabase("GatewayTestDb"));
-                });
+                services.RemoveAll<DbContextOptions<OrdersDbContext>>();
+                services.RemoveAll<OrdersDbContext>();
+                services.AddDbContext<OrdersDbContext>(options =>
+                    options.UseInMemoryDatabase("OrdersIsolationTestDb"));
             });
         });
 
@@ -109,7 +112,11 @@ public class CatalogIsolationTests :
         // Assert: Validate logic reading isolation
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-        var products = await response.Content.ReadFromJsonAsync<List<ProductResponse>>();
+        var apiResponse =
+            await response.Content.ReadFromJsonAsync<ApiResponse<List<ProductResponse>>>();
+        Assert.NotNull(apiResponse);
+        Assert.True(apiResponse.Success);
+        var products = apiResponse.Data;
         Assert.NotNull(products);
 
         Assert.Equal(2, products.Count);
@@ -142,13 +149,23 @@ public class CatalogIsolationTests :
         // Act: Save product
         var createResponse = await client.SendAsync(createRequest);
         Assert.Equal(HttpStatusCode.Created, createResponse.StatusCode);
+        Assert.NotNull(createResponse.Headers.Location);
+        var createdResponse =
+            await createResponse.Content.ReadFromJsonAsync<ApiResponse<ProductResponse>>();
+        Assert.NotNull(createdResponse);
+        Assert.True(createdResponse.Success);
+        Assert.NotNull(createdResponse.Data);
 
         // 2. Try to consult Alpha Store Catalog
         var queryRequest = new HttpRequestMessage(HttpMethod.Get, "/api/catalog/products");
         queryRequest.Headers.Add("X-Tenant-Id", "alpha-store");
 
         var queryResponse = await client.SendAsync(queryRequest);
-        var productsAlfa = await queryResponse.Content.ReadFromJsonAsync<List<ProductResponse>>();
+        var apiResponse =
+            await queryResponse.Content.ReadFromJsonAsync<ApiResponse<List<ProductResponse>>>();
+        Assert.NotNull(apiResponse);
+        Assert.True(apiResponse.Success);
+        var productsAlfa = apiResponse.Data;
 
         // Assert: Validate that the new product injected on Beta store 
         // cannot be visible on Alpha Store 
