@@ -7,9 +7,9 @@ namespace Comercio.Gateway;
 /// Middleware to intercept every perimeter HTTP request, extract
 /// the tenant ID, validate its commertial state and inject context
 /// </summary>
-public class TenantMiddleware(RequestDelegate next, InMemoryTenantStore store)
+public class TenantMiddleware(RequestDelegate next, ITenantStore store)
 {
-    public async Task InvokeAsync (HttpContext context, ITenantContext tenantContext)
+    public async Task InvokeAsync(HttpContext context, ITenantContext tenantContext)
     {
         string? subdomain = context.Request.Headers["X-Tenant-Id"].FirstOrDefault();
 
@@ -24,17 +24,18 @@ public class TenantMiddleware(RequestDelegate next, InMemoryTenantStore store)
             return;
         }
 
-        var tenant = store.GetBySubdomain(subdomain);
+        var tenant = await store.FindBySubdomainAsync(
+            subdomain,
+            context.RequestAborted);
 
         if (tenant is null)
         {
             context.Response.StatusCode = StatusCodes.Status404NotFound;
-            context.Response.ContentType = "application/json";
             await context.Response.WriteAsJsonAsync(
-                new
-                {
-                    Error = $"Tenant '{subdomain}' not registered on the platform."
-                }
+                ApiResponse<object>.Failed(
+                    "tenant_not_found",
+                    "The requested tenant is not registered."),
+                context.RequestAborted
             );
 
             return;
@@ -43,12 +44,11 @@ public class TenantMiddleware(RequestDelegate next, InMemoryTenantStore store)
         if (!tenant.IsActive)
         {
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
-            context.Response.ContentType = "application/json";
             await context.Response.WriteAsJsonAsync(
-                new
-                {
-                    Error = "The provided tenant is currently suspended"
-                }
+                ApiResponse<object>.Failed(
+                    "tenant_suspended",
+                    "The requested tenant is not active."),
+                context.RequestAborted
             );
 
             return;

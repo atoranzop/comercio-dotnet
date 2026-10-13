@@ -22,6 +22,12 @@ public class StockReleaseBackgroundService(
     // The service runs every 10th seconds in dev to facilitate testing
     private readonly TimeSpan _period = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// Processes expired orders repeatedly, waiting ten seconds between passes
+    /// until the service is stopped and logging processing failures.
+    /// </summary>
+    /// <param name="stoppingToken">Signals that the background service should stop.</param>
+    /// <returns>A task representing the lifetime of the expiration loop.</returns>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         logger.LogInformation("[BACKGROUND] Purchase stock expiration timer started.");
@@ -41,6 +47,13 @@ public class StockReleaseBackgroundService(
         }
     }
 
+    /// <summary>
+    /// Finds orders across all tenants with status "Pending payment" that are at least
+    /// fifteen minutes old, restores stock for existing products in each order's catalog
+    /// transaction, and then saves the successfully processed orders as "Cancelled".
+    /// </summary>
+    /// <param name="stoppingToken">The cancellation token passed to database operations.</param>
+    /// <returns>A task representing one pass of stock release and order status updates.</returns>
     private async Task ProcessExpiredOrderAsync(CancellationToken stoppingToken)
     {
         // Since it is a BackgroundService Singleton, we must create a scope to safely

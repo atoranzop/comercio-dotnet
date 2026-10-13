@@ -18,10 +18,13 @@ public class OrdersDbContext: DbContext
 
     public DbSet<Order> Orders => Set<Order>();
     public DbSet<OrderItem> OrderItems => Set<OrderItem>();
+    public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
+
+        modelBuilder.HasDefaultSchema("orders");
 
         // Order configuration
         modelBuilder.Entity<Order>(entity =>
@@ -46,6 +49,32 @@ public class OrdersDbContext: DbContext
                 .WithMany(o => o.Items)
                 .HasForeignKey(oi => oi.OrderId)
                 .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<OutboxMessage>(entity =>
+        {
+            entity.HasKey(message => message.Id);
+            entity.Property(message => message.EventType)
+                .IsRequired()
+                .HasMaxLength(200);
+            entity.Property(message => message.Payload)
+                .IsRequired()
+                .HasColumnType("jsonb");
+            entity.Property(message => message.OccurredAtUtc)
+                .HasColumnType("timestamp with time zone");
+            entity.Property(message => message.ProcessedAtUtc)
+                .HasColumnType("timestamp with time zone");
+            entity.Property(message => message.NextAttemptAtUtc)
+                .HasColumnType("timestamp with time zone");
+            entity.Property(message => message.LastError)
+                .HasMaxLength(4000);
+            entity.HasIndex(message => new
+                {
+                    message.ProcessedAtUtc,
+                    message.NextAttemptAtUtc,
+                    message.OccurredAtUtc
+                })
+                .HasDatabaseName("IX_OutboxMessages_Pending");
         });
     }
 

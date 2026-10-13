@@ -3,10 +3,10 @@ using Comercio.Shared;
 namespace Comercio.Gateway;
 
 /// <summary>
-/// Mock in-memory database for the tenants catalog.
-/// Avoids physical infrastructure dependency during Phase 1 development
+/// In-memory tenant store for isolated tests.
 /// </summary>
 public class InMemoryTenantStore
+    : ITenantStore
 {
     // Uses the modern collection expressions [] sytax of C#
     private readonly Dictionary<string, TenantDto> _tenantsBySubdomain =
@@ -34,12 +34,12 @@ public class InMemoryTenantStore
         )
     };
 
-    /// <summary>
-    /// Recovers a tenant given its identifying subdomain
-    /// </summary>
-    public TenantDto? GetBySubdomain(string subdomain)
+    public Task<TenantDto?> FindBySubdomainAsync(
+        string subdomain,
+        CancellationToken cancellationToken = default)
     {
-        return _tenantsBySubdomain.TryGetValue(subdomain, out var tenant) ?
-            tenant: null;
+        cancellationToken.ThrowIfCancellationRequested();
+        _tenantsBySubdomain.TryGetValue(subdomain, out var tenant);
+        return Task.FromResult(tenant);
     }
 }

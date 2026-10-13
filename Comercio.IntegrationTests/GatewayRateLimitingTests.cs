@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Json;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -9,6 +10,7 @@ using Orders.Infrastructure.Persistence;
 using Xunit;
 using Comercio.Gateway;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Comercio.Shared;
 
 namespace Comercio.IntegrationTests;
 
@@ -66,6 +68,11 @@ public class GatewayRateLimitingTests: IClassFixture<WebApplicationFactory<Progr
 
         // Assert: System must return atomically status 429
         Assert.Equal(HttpStatusCode.TooManyRequests, limitExceededResponse.StatusCode); 
+        var body = await limitExceededResponse.Content
+            .ReadFromJsonAsync<ApiResponse<object>>();
+        Assert.NotNull(body);
+        Assert.False(body.Success);
+        Assert.Equal("rate_limit_exceeded", body.Error?.Code);
     }
 
     [Fact]
