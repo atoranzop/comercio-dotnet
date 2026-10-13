@@ -1,8 +1,8 @@
 # Comercio
 
-https://img.shields.io/badge/.NET-10.0-purple
-https://img.shields.io/badge/Architecture-Monolith_Modular_%2B_API_Gateway-blue
-https://img.shields.io/badge/License-Proprietary-red
+![.NET Core](https://img.shields.io/badge/.NET-10.0-purple)
+![Architecture](https://img.shields.io/badge/Architecture-Monolith_Modular_%2B_API_Gateway-blue)
+[![License](https://img.shields.io/badge/License-GPLv3-blue)](https://www.gnu.org/licenses/gpl-3.0.html)
 
 Comercio is a .NET 10, multi-tenant commerce backend built around an ASP.NET
 Core API Gateway. It demonstrates tenant-aware product catalog and order
